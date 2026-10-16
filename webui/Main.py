@@ -11,7 +11,8 @@ import sys
 import tempfile
 import time
 import webbrowser
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -8917,6 +8918,367 @@ def _close_dialog_button(key):
         st.rerun(scope="app")
 
 
+# -----------------------------------------------------------------------------
+# 标准中后台表格：发布管理 / 账号管理 / 素材库 / 脚本库共用一套骨架
+# -----------------------------------------------------------------------------
+# 原来的 ``_render_record_table`` 是「点行开详情」一行式表格；现在按
+# 标准管理平台的形态重做：上方一条工具栏（新增 / 搜索 / 筛选 / 批量操作），
+# 中间表格区有复选框列 + 数据列 + 操作列，底部带分页。四个管理页都改用
+# ``_render_admin_table``，配置改成传 dataclass/可调用对象的形式，
+# 避免每个页面再重复写一遍 checkbox / 分页 / 批量按钮的样板代码。
+
+@dataclass(frozen=True)
+class AdminColumn:
+    """admin_table 的列定义。
+
+    ``ratio`` 是相对宽度（与其它列、复选框列、操作列一起做 ``st.columns``）。
+    ``render`` 可选；不传则直接 ``str(record[col.key])``。
+    ``image`` 为 True 时值会被当成图片 data URI 渲染；空值显示占位。
+    """
+
+    key: str
+    label: str
+    ratio: float
+    render: Callable[[dict], object] | None = None
+    image: bool = False
+
+
+@dataclass(frozen=True)
+class AdminRowAction:
+    """admin_table 每行的操作按钮（编辑、删除等）。
+
+    ``callback(record)`` 在按钮被点击的那一轮同步执行（on_click 形式），
+    里面要 ``st.rerun(scope="app")`` 才会让列表刷新。
+    """
+
+    key: str
+    label: str
+    callback: Callable[[dict], None]
+    icon: str | None = None
+    button_type: str = "secondary"  # "primary" | "secondary" | "tertiary"
+
+
+@dataclass(frozen=True)
+class AdminBulkAction:
+    """admin_table 选中后启用的批量操作按钮。
+
+    ``label`` 里可以含 ``{count}`` 占位符，渲染时替换成当前选中条数。
+    ``callback(records)`` 接收被选中的原始记录列表。
+    """
+
+    key: str
+    label: str
+    callback: Callable[[list], None]
+    icon: str | None = None
+    button_type: str = "secondary"
+
+
+@dataclass(frozen=True)
+class AdminFilter:
+    """admin_table 工具栏里的筛选下拉。
+
+    渲染成 ``selectbox``，选项来自 ``options``，``format_func`` 与
+    ``stable_selectbox`` 一致；筛选值落在 ``key`` 上，由调用方读取并
+    重新过滤 ``records`` 后再调用本组件。
+    """
+
+    label: str
+    options: Sequence
+    default: object
+    key: str
+    format_func: Callable[[object], str] | None = None
+
+
+def _toggle_admin_selection(name, idx):
+    """复选框回调：把 idx 加入/移出当前选中集合。
+
+    选中集合是 ``records`` 的下标列表，存在 ``st.session_state``
+    的 ``f"{name}_admin_selected"`` 里。回调必须用 on_change 形式触发，
+    直接在 checkbox 后 ``if value: ...`` 写修改是无效的：Streamlit
+    会先读控件状态再跑页面逻辑，等页面代码看到值时已经晚了。
+    """
+    selected = st.session_state.setdefault(f"{name}_admin_selected", [])
+    if idx in selected:
+        selected.remove(idx)
+    else:
+        selected.append(idx)
+
+
+def _clear_admin_selection(name):
+    """清掉 admin_table 的选中集合（批量操作完成后调用）。"""
+    st.session_state[f"{name}_admin_selected"] = []
+
+
+def _prune_admin_selection(name, total):
+    """把超出 records 范围的过期下标清掉，避免列表变短后残留无效选中。"""
+    selected_key = f"{name}_admin_selected"
+    selected = [
+        idx for idx in st.session_state.get(selected_key, [])
+        if isinstance(idx, int) and 0 <= idx < total
+    ]
+    if selected != st.session_state.get(selected_key, []):
+        st.session_state[selected_key] = selected
+    return selected
+
+
+def _set_admin_del_pending(name, idx):
+    """设置 admin_table 当前「行内删除待确认」的目标下标。"""
+
+    st.session_state[f"{name}_admin_del_pending"] = idx
+
+
+def _clear_admin_del_pending(name):
+    """清掉 admin_table 的「行内删除待确认」标志。"""
+
+    st.session_state.pop(f"{name}_admin_del_pending", None)
+
+
+def _render_admin_table(
+    name,
+    records,
+    columns,
+    *,
+    row_actions=(),
+    bulk_actions=(),
+    page_size=10,
+    add_label=None,
+    add_callback=None,
+    toolbar_search_label=None,
+    toolbar_search_key=None,
+    toolbar_filters=(),
+    empty_message=None,
+    total_label=None,
+    page_label=None,
+):
+    """渲染标准中后台表格：工具栏 + 数据行 + 分页栏。
+
+    状态约定（全部存在 ``st.session_state`` 里）：
+    - 选中下标集合 ``f"{name}_admin_selected"``
+    - 当前页码 ``f"{name}_admin_page"``
+    - 行内删除待确认下标 ``f"{name}_admin_del_pending"``
+    - 工具栏搜索框 key 由 ``toolbar_search_key`` 指定
+    - 工具栏筛选下拉 key 由各 ``AdminFilter.key`` 指定
+
+    行内删除约定：``row_actions`` 里 ``key == "_admin_delete"`` 的按钮被点后
+    会先进入「行内待确认」态（同行的按钮变成 ✓确认 + ✗取消），需要再点 ✓ 才
+    执行 ``callback``。其他 ``row_actions`` 是直接 on_click 触发的图标按钮。
+
+    调用方负责：
+    - 自己读 toolbar_search_key / 各 filter key，把过滤后的 ``records`` 传进来
+    - add_callback / row callback / bulk callback 完成后自己 ``st.rerun(scope="app")``
+    """
+    selection_key = f"{name}_admin_selected"
+    page_key = f"{name}_admin_page"
+    del_pending_key = f"{name}_admin_del_pending"
+    del_pending_idx = st.session_state.get(del_pending_key)
+    if not isinstance(del_pending_idx, int) or del_pending_idx < 0 or del_pending_idx >= len(records):
+        if del_pending_idx is not None:
+            st.session_state.pop(del_pending_key, None)
+        del_pending_idx = None
+
+    # 操作列里有一个特殊的 "_admin_delete"：它会进"行内待确认"态，
+    # 按钮从 1 个变成 2 个（✓确认 + ✗取消）。操作列宽度始终按
+    # ``len(row_actions) + 1`` 预留，避免态切换时整行宽度跳变。
+    n_action_slots = max(len(row_actions), 1) + 1
+    action_ratio = max(1.8, 0.95 * n_action_slots)
+
+    # --- 工具栏：新增 + 搜索 + 筛选 + 批量 ---
+    # 搜索/筛选放在工具栏内以体现"标准管理后台"形态：所有交互平铺在一行，
+    # 窄屏下由 st.container(horizontal=True) 自动换行。
+    # 这里只负责渲染；调用方负责读搜索/筛选 key 后过滤 records 再重画。
+    with st.container(
+        key=f"{name}_admin_toolbar",
+        horizontal=True,
+        gap="small",
+        vertical_alignment="center",
+    ):
+        if add_label and add_callback:
+            if st.button(
+                add_label,
+                key=f"{name}_admin_add",
+                type="primary",
+                icon=":material/add:",
+                width="content",
+            ):
+                add_callback()
+                st.rerun(scope="app")
+        if toolbar_search_label and toolbar_search_key:
+            st.text_input(
+                toolbar_search_label,
+                key=toolbar_search_key,
+                placeholder=tr("Admin Search Placeholder"),
+                label_visibility="collapsed",
+            )
+        for filter_spec in toolbar_filters:
+            current = st.session_state.get(filter_spec.key, filter_spec.default)
+            # format_func 必须绑默认参数，避免按引用捕获多个筛选共用同一个
+            # labels 字典导致显示错位（这个坑在主表单里踩过）。
+            if filter_spec.format_func is None:
+
+                def format_func(value, opts=filter_spec.options):
+                    if isinstance(opts, dict):
+                        return opts.get(value, value)
+                    return str(value)
+
+            else:
+
+                def format_func(value, fn=filter_spec.format_func):
+                    return fn(value)
+
+            stable_selectbox(
+                filter_spec.label,
+                options=list(filter_spec.options),
+                default_value=current,
+                key=filter_spec.key,
+                format_func=format_func,
+                label_visibility="collapsed",
+            )
+        # 批量按钮和搜索/筛选平铺在工具栏里；选中条数为 0 时禁用，UI
+        # 上立即给反馈，避免点完发现没反应。
+        selected_now = _prune_admin_selection(name, len(records))
+        for bulk in bulk_actions:
+            label = (
+                bulk.label.format(count=len(selected_now))
+                if "{count}" in bulk.label
+                else bulk.label
+            )
+            if st.button(
+                label,
+                key=f"{name}_admin_bulk_{bulk.key}",
+                icon=bulk.icon,
+                type=bulk.button_type,
+                disabled=not selected_now,
+                width="content",
+            ):
+                bulk.callback([records[i] for i in selected_now])
+                _clear_admin_selection(name)
+                st.rerun(scope="app")
+
+    # --- 表头 ---
+    col_ratios = [0.55] + [c.ratio for c in columns] + ([action_ratio] if row_actions else [])
+    header_cols = st.columns(col_ratios, vertical_alignment="center", gap="small")
+    # 复选框列表头：用一个零宽字符撑住列宽，让表头和数据列对齐
+    header_cols[0].markdown(
+        "&nbsp;",
+        help=tr("Admin Selection Help"),
+    )
+    for i, col_def in enumerate(columns):
+        header_cols[i + 1].markdown(f"**{col_def.label}**")
+    if row_actions:
+        header_cols[-1].markdown(f"**{tr('Admin Col Action')}**")
+
+    if not records:
+        if empty_message:
+            st.info(empty_message)
+        return
+
+    # --- 分页 ---
+    total = len(records)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = st.session_state.get(page_key, 0)
+    if not isinstance(page, int) or page < 0 or page >= total_pages:
+        page = 0
+    start = page * page_size
+    end = min(total, start + page_size)
+    page_records = records[start:end]
+
+    # --- 数据行 ---
+    for offset, record in enumerate(page_records):
+        global_idx = start + offset
+        row_cols = st.columns(col_ratios, vertical_alignment="center", gap="small")
+        with row_cols[0]:
+            # 零宽空格作为占位 label：label_visibility="collapsed" 会隐藏，
+            # 但 label 不能完全为空（Streamlit 1.59 会打 a11y warning）。
+            st.checkbox(
+                "\u200b",
+                value=global_idx in st.session_state.get(selection_key, []),
+                key=f"{name}_admin_chk_{global_idx}",
+                on_change=_toggle_admin_selection,
+                args=(name, global_idx),
+                label_visibility="collapsed",
+            )
+        for i, col_def in enumerate(columns):
+            value = col_def.render(record) if col_def.render else record.get(col_def.key, "")
+            if col_def.image:
+                if value:
+                    # 缩略图固定 64px 宽，避免在大列表里把列撑爆；
+                    # data URI 直接透传，绕开 /media/ 500。
+                    row_cols[i + 1].image(value, width=64)
+                else:
+                    row_cols[i + 1].caption("—")
+            else:
+                text = "" if value is None else str(value)
+                row_cols[i + 1].write(text)
+        if row_actions:
+            with row_cols[-1]:
+                with st.container(horizontal=True, gap="small"):
+                    if del_pending_idx == global_idx:
+                        # 待确认态：渲染 ✓确认 + ✗取消 两个按钮。
+                        # ✓按钮直接走 action.callback（删除），✗按钮清掉标志位。
+                        for action in row_actions:
+                            if action.key == "_admin_delete":
+                                st.button(
+                                    "✓",
+                                    key=f"{name}_admin_del_ok_{global_idx}",
+                                    type="primary",
+                                    help=action.label,
+                                    on_click=action.callback,
+                                    args=(record,),
+                                )
+                        st.button(
+                            "✗",
+                            key=f"{name}_admin_del_cancel_{global_idx}",
+                            help=tr("Cancel"),
+                            on_click=_clear_admin_del_pending,
+                            args=(name,),
+                        )
+                    else:
+                        for action in row_actions:
+                            if action.key == "_admin_delete":
+                                st.button(
+                                    action.label,
+                                    key=f"{name}_admin_act__admin_delete_{global_idx}",
+                                    icon=action.icon,
+                                    type=action.button_type,
+                                    on_click=_set_admin_del_pending,
+                                    args=(name, global_idx),
+                                )
+                            else:
+                                st.button(
+                                    action.label,
+                                    key=f"{name}_admin_act_{action.key}_{global_idx}",
+                                    icon=action.icon,
+                                    type=action.button_type,
+                                    on_click=action.callback,
+                                    args=(record,),
+                                )
+
+    # --- 分页栏 ---
+    pag_cols = st.columns([2.5, 2.5, 1, 1], vertical_alignment="center", gap="small")
+    if total_label:
+        pag_cols[0].caption(total_label.format(start=start + 1, end=end, total=total))
+    if page_label:
+        pag_cols[1].caption(page_label.format(current=page + 1, total=total_pages))
+    with pag_cols[2]:
+        if st.button(
+            tr("Admin Prev Page"),
+            key=f"{name}_admin_prev",
+            disabled=page == 0,
+            width="stretch",
+        ):
+            st.session_state[page_key] = page - 1
+            st.rerun(scope="app")
+    with pag_cols[3]:
+        if st.button(
+            tr("Admin Next Page"),
+            key=f"{name}_admin_next",
+            disabled=page >= total_pages - 1,
+            width="stretch",
+        ):
+            st.session_state[page_key] = page + 1
+            st.rerun(scope="app")
+
+
 def _video_platform_tag_text(video, platform_labels):
     """表格「平台标记」列：没打标记时给一个明确的占位文案。"""
     platforms = list(video["platforms"])
@@ -8946,6 +9308,45 @@ def _video_table_rows(videos, platform_labels):
             }
         )
     return rows
+
+
+@st.dialog(tr("Board Add Title"), width="medium", on_dismiss=_close_record_dialog)
+def _video_create_dialog():
+    """新增视频记录弹窗：填主题 / 路径 / 备注，提交即入库。"""
+    subject_key = "pb_create_dialog_subject"
+    _seed_widget_state(subject_key, "")
+    subject = st.text_input(
+        tr("Board Video Subject"), key=subject_key, max_chars=publish_board.MAX_SUBJECT_LENGTH
+    )
+    path_key = "pb_create_dialog_path"
+    _seed_widget_state(path_key, "")
+    path = st.text_input(
+        tr("Board Video Path"),
+        key=path_key,
+        placeholder=tr("Board Video Path Placeholder"),
+        max_chars=publish_board.MAX_URL_LENGTH,
+    )
+    remark_key = "pb_create_dialog_remark"
+    _seed_widget_state(remark_key, "")
+    remark = st.text_area(
+        tr("Board Remark"), key=remark_key, height=70, max_chars=publish_board.MAX_REMARK_LENGTH
+    )
+    action_cols = st.columns([1, 1])
+    if action_cols[0].button(
+        tr("Board Add Video Submit"), type="primary", width="stretch",
+        key="pb_create_dialog_submit",
+    ):
+        if not subject.strip():
+            st.error(tr("Board Subject Required"))
+        else:
+            publish_board.create_video(
+                subject=subject, video_path=path, remark=remark,
+            )
+            _show_flash(tr("Board Video Added"))
+            st.rerun(scope="app")
+    action_cols[1].button(
+        tr("Cancel"), width="stretch", key="pb_create_dialog_cancel",
+    )
 
 
 @st.dialog(tr("Board Detail Title"), width="large", on_dismiss=_close_record_dialog)
@@ -9112,95 +9513,143 @@ def _render_publish_board_page():
 
     accounts = publish_board.list_accounts()
 
-    with st.expander(tr("Board Add Video"), expanded=False):
-        with st.form("pb_add_video_form", clear_on_submit=True):
-            manual_subject = st.text_input(
-                tr("Board Video Subject"), max_chars=publish_board.MAX_SUBJECT_LENGTH
-            )
-            manual_path = st.text_input(
-                tr("Board Video Path"),
-                placeholder=tr("Board Video Path Placeholder"),
-                max_chars=publish_board.MAX_URL_LENGTH,
-            )
-            manual_remark = st.text_area(
-                tr("Board Remark"), height=70, max_chars=publish_board.MAX_REMARK_LENGTH
-            )
-            if st.form_submit_button(tr("Board Add Video Submit"), type="primary"):
-                if not manual_subject.strip():
-                    st.error(tr("Board Subject Required"))
-                else:
-                    publish_board.create_video(
-                        subject=manual_subject,
-                        video_path=manual_path,
-                        remark=manual_remark,
-                    )
-                    st.success(tr("Board Video Added"))
-                    st.rerun()
+    # 搜索 / 平台筛选 / 来源筛选都搬到 admin_table 工具栏里，调用方只负责
+    # 把过滤结果喂给表格。关键 key 全部本地化（跟原实现保持一致）。
+    search_key = localized_widget_key("pb_admin_search")
+    platform_filter_key = localized_widget_key("pb_admin_platform")
+    origin_filter_key = localized_widget_key("pb_admin_origin")
+    keyword = st.session_state.get(search_key, "")
+    platform_filter = st.session_state.get(platform_filter_key, "")
+    origin_filter = st.session_state.get(origin_filter_key, "")
 
-    filter_cols = st.columns([2.2, 1.0, 1.0])
-    keyword = filter_cols[0].text_input(
-        tr("Board Search"),
-        key="pb_filter_keyword",
-        placeholder=tr("Board Search Placeholder"),
-    )
     # 翻译文案必须在创建控件之前算好：format_func 会在控件状态重建时被再次
-    # 调用，那一刻不在脚本上下文里，读 st.session_state 会直接抛错，最终
-    # 表现为下拉框显示空白。
+    # 调用，那一刻不在脚本上下文里，读 st.session_state 会直接抛错。
     all_filter_label = tr("Board Filter All")
     origin_labels = {
         "": all_filter_label,
         publish_board.ORIGIN_AUTO: tr("Board Origin Auto"),
         publish_board.ORIGIN_MANUAL: tr("Board Origin Manual"),
     }
-    platform_filter = filter_cols[1].selectbox(
-        tr("Board Filter Platform"),
-        options=[""] + list(publish_board.PLATFORM_IDS),
-        format_func=lambda platform_id, labels=platform_labels, fallback=all_filter_label: (
-            labels.get(platform_id, platform_id) if platform_id else fallback
-        ),
-        key=localized_widget_key("pb_filter_platform"),
-    )
-    origin_filter = filter_cols[2].selectbox(
-        tr("Board Filter Origin"),
-        options=["", publish_board.ORIGIN_AUTO, publish_board.ORIGIN_MANUAL],
-        format_func=lambda origin, labels=origin_labels: labels.get(origin, origin),
-        key=localized_widget_key("pb_filter_origin"),
-    )
 
     videos = publish_board.list_videos(
         keyword=keyword, platform=platform_filter, origin=origin_filter
     )
-    if not videos:
-        st.info(tr("Board No Videos"))
-        return
+    rows = _video_table_rows(videos, platform_labels)
+    # 把原始 video 一并放进行 dict，给"编辑/删除"回调回传用。
+    for row, video in zip(rows, videos):
+        row["record"] = video
 
-    _render_record_table_hint()
-    selected = _render_record_table(
+    def _edit_video(row):
+        _video_detail_dialog(
+            row["record"], accounts, platform_labels, ui_language
+        )
+
+    def _delete_video(row):
+        publish_board.delete_video(row["record"]["id"])
+        st.rerun(scope="app")
+
+    def _bulk_delete_videos(selected_rows):
+        for row in selected_rows:
+            try:
+                publish_board.delete_video(row["record"]["id"])
+            except Exception as error:  # noqa: BLE001
+                st.session_state.setdefault(
+                    "pb_admin_bulk_skipped", []
+                ).append(row["record"]["subject"])
+        st.rerun(scope="app")
+
+    _render_admin_table(
         "pb",
-        _video_table_rows(videos, platform_labels),
-        {
-            "subject": st.column_config.TextColumn(
-                tr("Board Col Subject"), width="large"
+        rows,
+        [
+            AdminColumn(
+                key="subject",
+                label=tr("Board Col Subject"),
+                ratio=2.5,
             ),
-            "platforms": st.column_config.TextColumn(
-                tr("Board Col Platforms"), width="medium"
+            AdminColumn(
+                key="platforms",
+                label=tr("Board Col Platforms"),
+                ratio=1.5,
             ),
-            "bindings": st.column_config.NumberColumn(
-                tr("Board Col Bindings"), width="small"
+            AdminColumn(
+                key="bindings",
+                label=tr("Board Col Bindings"),
+                ratio=0.7,
             ),
-            "origin": st.column_config.TextColumn(tr("Board Col Origin"), width="small"),
-            "generated_at": st.column_config.TextColumn(
-                tr("Board Col Generated"), width="small"
+            AdminColumn(
+                key="origin",
+                label=tr("Board Col Origin"),
+                ratio=0.7,
             ),
-            "video_size": st.column_config.TextColumn(
-                tr("Board Col Size"), width="small"
+            AdminColumn(
+                key="generated_at",
+                label=tr("Board Col Generated"),
+                ratio=1.0,
             ),
-            "remark": st.column_config.TextColumn(tr("Board Col Remark"), width="medium"),
-        },
-        caption=tr("Board Video Count").format(count=len(videos)),
+            AdminColumn(
+                key="video_size",
+                label=tr("Board Col Size"),
+                ratio=0.8,
+            ),
+            AdminColumn(
+                key="remark",
+                label=tr("Board Col Remark"),
+                ratio=1.8,
+            ),
+        ],
+        row_actions=[
+            AdminRowAction(
+                key="edit",
+                label=tr("Board Edit Video"),
+                icon=":material/edit:",
+                callback=_edit_video,
+            ),
+            AdminRowAction(
+                key="_admin_delete",
+                label=tr("Board Delete Video"),
+                icon=":material/delete:",
+                callback=_delete_video,
+            ),
+        ],
+        bulk_actions=[
+            AdminBulkAction(
+                key="bulk_del",
+                label=tr("Admin Bulk Delete"),
+                icon=":material/delete_sweep:",
+                callback=_bulk_delete_videos,
+            ),
+        ],
+        add_label=tr("Board Add New"),
+        add_callback=lambda: _video_create_dialog(),
+        toolbar_search_label=tr("Board Search"),
+        toolbar_search_key=search_key,
+        toolbar_filters=[
+            AdminFilter(
+                label=tr("Board Filter Platform"),
+                options=[""] + list(publish_board.PLATFORM_IDS),
+                default="",
+                key=platform_filter_key,
+                format_func=lambda pid, labels=platform_labels, fallback=all_filter_label: (
+                    fallback if pid == "" else labels.get(pid, pid)
+                ),
+            ),
+            AdminFilter(
+                label=tr("Board Filter Origin"),
+                options=["", publish_board.ORIGIN_AUTO, publish_board.ORIGIN_MANUAL],
+                default="",
+                key=origin_filter_key,
+                format_func=lambda origin, labels=origin_labels: labels.get(origin, origin),
+            ),
+        ],
+        empty_message=tr("Board No Videos"),
+        total_label=tr("Admin Total Of"),
+        page_label=tr("Admin Page Of"),
+        page_size=10,
     )
-    if selected is not None:
-        _video_detail_dialog(videos[selected], accounts, platform_labels, ui_language)
+
+    if st.session_state.pop("pb_admin_bulk_skipped", None):
+        st.warning(tr("Admin Bulk Delete Skipped"))
 
 
 def _render_accounts_page():
@@ -9213,85 +9662,147 @@ def _render_accounts_page():
     st.subheader(tr("Accounts Title"))
     st.caption(tr("Accounts Help"))
 
-    with st.expander(tr("Account Add"), expanded=False):
-        with st.form("pb_add_account_form", clear_on_submit=True):
-            new_platform = st.selectbox(
-                tr("Account Platform"),
-                options=list(publish_board.PLATFORM_IDS),
-                format_func=lambda platform_id: platform_labels.get(platform_id, platform_id),
-            )
-            new_name = st.text_input(
-                tr("Account Name"), max_chars=publish_board.MAX_ACCOUNT_NAME_LENGTH
-            )
-            new_uid = st.text_input(
-                tr("Account ID"), max_chars=publish_board.MAX_ACCOUNT_ID_LENGTH
-            )
-            new_url = st.text_input(
-                tr("Account Profile Url"), max_chars=publish_board.MAX_URL_LENGTH
-            )
-            new_remark = st.text_area(
-                tr("Account Remark"), height=70, max_chars=publish_board.MAX_REMARK_LENGTH
-            )
-            if st.form_submit_button(tr("Account Add Submit"), type="primary"):
-                try:
-                    publish_board.create_account(
-                        platform=new_platform,
-                        account_name=new_name,
-                        account_id=new_uid,
-                        profile_url=new_url,
-                        remark=new_remark,
-                    )
-                except ValueError as error:
-                    st.error(tr("Account Name Required") if "name" in str(error) else str(error))
-                else:
-                    st.success(tr("Account Added"))
-                    st.rerun()
-
     accounts = publish_board.list_accounts()
-    if not accounts:
-        st.info(tr("Account No Accounts"))
-        return
+    stats = publish_board.summary()
+    metric_cols = st.columns(4)
+    metric_cols[0].metric(tr("Board Stat Accounts"), stats["accounts"])
+    metric_cols[1].metric(tr("Board Stat Bindings"), stats["bindings"])
+    metric_cols[2].metric(tr("Account Col Platform"), len(platform_labels))
+    metric_cols[3].metric(tr("Account Col Bindings"), sum(
+        publish_board.count_account_bindings(account["id"]) for account in accounts
+    ))
 
-    _render_record_table_hint()
-    selected = _render_record_table(
-        "ac",
-        [
-            {
-                "platform": platform_labels.get(
-                    account["platform"], account["platform"]
-                ),
-                "account_name": account["account_name"],
-                "account_id": account["account_id"],
-                "profile_url": account["profile_url"],
-                "remark": account["remark"],
-                "bindings": publish_board.count_account_bindings(account["id"]),
-            }
-            for account in accounts
-        ],
+    # 搜索 / 平台筛选 / 新增都在 admin_table 工具栏里，组件只负责渲染，
+    # 这里把过滤 + 列表渲染 + 操作回调串起来。
+    search_key = localized_widget_key("ac_admin_search")
+    platform_filter_key = localized_widget_key("ac_admin_platform")
+    keyword = st.session_state.get(search_key, "")
+    platform_filter = st.session_state.get(platform_filter_key, "")
+    if keyword:
+        lowered = keyword.lower()
+        accounts = [
+            account for account in accounts
+            if any(
+                lowered in (account.get(field) or "").lower()
+                for field in ("account_name", "account_id", "remark")
+            )
+        ]
+    if platform_filter:
+        accounts = [account for account in accounts if account["platform"] == platform_filter]
+
+    all_platforms_label = tr("Account Filter All Platforms")
+    rows = [
         {
-            "platform": st.column_config.TextColumn(
-                tr("Account Col Platform"), width="small"
+            **account,
+            "platform_label": platform_labels.get(
+                account["platform"], account["platform"]
             ),
-            "account_name": st.column_config.TextColumn(
-                tr("Account Col Name"), width="medium"
+            "bindings_count": publish_board.count_account_bindings(account["id"]),
+        }
+        for account in accounts
+    ]
+
+    def _edit_account(record):
+        _account_detail_dialog(record, platform_labels)
+
+    def _delete_account(record):
+        # 行内两段式触发的是 _admin_delete 按钮的 ✓ 回调，这里直接落库；
+        # 失败时 publish_board 会抛 ValueError，admin_table 不再额外处理。
+        publish_board.delete_account(record["id"])
+        st.rerun(scope="app")
+
+    def _bulk_delete_accounts(selected_rows):
+        for record in selected_rows:
+            try:
+                publish_board.delete_account(record["id"])
+            except ValueError:
+                # 已被绑定过的账号不能删，与单行删除保持一致：跳过被阻止的项，
+                # 不让整批失败；记录到 session_state 留给上层展示。
+                st.session_state.setdefault(
+                    "ac_admin_bulk_skipped", []
+                ).append(record["account_name"])
+        st.rerun(scope="app")
+
+    _render_admin_table(
+        "ac",
+        rows,
+        [
+            AdminColumn(
+                key="platform_label",
+                label=tr("Account Col Platform"),
+                ratio=0.9,
             ),
-            "account_id": st.column_config.TextColumn(
-                tr("Account Col Uid"), width="small"
+            AdminColumn(
+                key="account_name",
+                label=tr("Account Col Name"),
+                ratio=1.6,
             ),
-            "profile_url": st.column_config.LinkColumn(
-                tr("Account Col Url"), width="medium"
+            AdminColumn(
+                key="account_id",
+                label=tr("Account Col Uid"),
+                ratio=1.0,
             ),
-            "remark": st.column_config.TextColumn(
-                tr("Account Col Remark"), width="medium"
+            AdminColumn(
+                key="profile_url",
+                label=tr("Account Col Url"),
+                ratio=1.6,
+                render=lambda r: f"[link]({r['profile_url']})" if r.get("profile_url") else "—",
             ),
-            "bindings": st.column_config.NumberColumn(
-                tr("Account Col Bindings"), width="small"
+            AdminColumn(
+                key="remark",
+                label=tr("Account Col Remark"),
+                ratio=2.0,
             ),
-        },
-        caption=tr("Account Count").format(count=len(accounts)),
+            AdminColumn(
+                key="bindings_count",
+                label=tr("Account Col Bindings"),
+                ratio=0.7,
+            ),
+        ],
+        row_actions=[
+            AdminRowAction(
+                key="edit",
+                label=tr("Account Edit"),
+                icon=":material/edit:",
+                callback=_edit_account,
+            ),
+            AdminRowAction(
+                key="_admin_delete",
+                label=tr("Account Delete"),
+                icon=":material/delete:",
+                callback=_delete_account,
+            ),
+        ],
+        bulk_actions=[
+            AdminBulkAction(
+                key="bulk_del",
+                label=tr("Admin Bulk Delete"),
+                icon=":material/delete_sweep:",
+                callback=_bulk_delete_accounts,
+            ),
+        ],
+        add_label=tr("Account Add New"),
+        add_callback=lambda: _account_create_dialog(platform_labels),
+        toolbar_search_label=tr("Account Search"),
+        toolbar_search_key=search_key,
+        toolbar_filters=[
+            AdminFilter(
+                label=tr("Account Col Platform"),
+                options=[""] + list(publish_board.PLATFORM_IDS),
+                default="",
+                key=platform_filter_key,
+                format_func=lambda pid, labels=platform_labels, fallback=all_platforms_label:
+                    fallback if pid == "" else labels.get(pid, pid),
+            ),
+        ],
+        empty_message=tr("Account No Accounts"),
+        total_label=tr("Admin Total Of"),
+        page_label=tr("Admin Page Of"),
+        page_size=10,
     )
-    if selected is not None:
-        _account_detail_dialog(accounts[selected], platform_labels)
+
+    if st.session_state.pop("ac_admin_bulk_skipped", None):
+        st.warning(tr("Admin Bulk Delete Skipped"))
 
 
 @st.dialog(tr("Account Detail Title"), width="large", on_dismiss=_close_record_dialog)
@@ -9369,6 +9880,63 @@ def _account_detail_dialog(account, platform_labels):
         tr("Account Confirm Delete"),
     )
     _close_dialog_button(f"ac_detail_close_{account_id}")
+
+
+@st.dialog(tr("Account Add Title"), width="medium", on_dismiss=_close_record_dialog)
+def _account_create_dialog(platform_labels):
+    """新增账号弹窗：填平台/账号名/账号 ID/主页/备注，提交即入库。"""
+    platform_key = "ac_create_dialog_platform"
+    _seed_widget_state(platform_key, publish_board.PLATFORM_IDS[0])
+    platform_value = st.selectbox(
+        tr("Account Platform"),
+        options=list(publish_board.PLATFORM_IDS),
+        format_func=lambda platform_id: platform_labels.get(platform_id, platform_id),
+        key=platform_key,
+    )
+    name_key = "ac_create_dialog_name"
+    _seed_widget_state(name_key, "")
+    name_value = st.text_input(
+        tr("Account Name"), key=name_key, max_chars=publish_board.MAX_ACCOUNT_NAME_LENGTH
+    )
+    uid_key = "ac_create_dialog_uid"
+    _seed_widget_state(uid_key, "")
+    uid_value = st.text_input(
+        tr("Account ID"), key=uid_key, max_chars=publish_board.MAX_ACCOUNT_ID_LENGTH
+    )
+    url_key = "ac_create_dialog_url"
+    _seed_widget_state(url_key, "")
+    url_value = st.text_input(
+        tr("Account Profile Url"), key=url_key, max_chars=publish_board.MAX_URL_LENGTH
+    )
+    remark_key = "ac_create_dialog_remark"
+    _seed_widget_state(remark_key, "")
+    remark_value = st.text_area(
+        tr("Account Remark"), key=remark_key, height=70, max_chars=publish_board.MAX_REMARK_LENGTH
+    )
+    action_cols = st.columns([1, 1])
+    if action_cols[0].button(
+        tr("Account Add Submit"), type="primary", width="stretch",
+        key="ac_create_dialog_submit",
+    ):
+        try:
+            publish_board.create_account(
+                platform=platform_value,
+                account_name=name_value,
+                account_id=uid_value,
+                profile_url=url_value,
+                remark=remark_value,
+            )
+        except ValueError as error:
+            st.error(
+                tr("Account Name Required") if "name" in str(error) else str(error)
+            )
+        else:
+            # 通知列表刷新；弹窗本身由 on_dismiss 关掉时会清掉行选中。
+            _show_flash(tr("Account Added"))
+            st.rerun(scope="app")
+    action_cols[1].button(
+        tr("Cancel"), width="stretch", key="ac_create_dialog_cancel",
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -9481,6 +10049,7 @@ def _material_table_rows(materials, ui_language):
                 ),
                 "created_at": str(material["created_at"]).replace("T", " ")[:16],
                 "remark": material["remark"],
+                "record": material,
             }
         )
     return rows
@@ -9580,6 +10149,8 @@ def _render_media_library_page():
     metric_cols[2].metric(tr("Library Stat Videos"), stats["videos"])
     metric_cols[3].metric(tr("Library Stat Size"), media_library.format_size(stats["bytes"]))
 
+    # 上传是素材库的核心入口；file_uploader 不便塞进 dialog / 工具栏按钮，
+    # 这里继续保留 expander 区块。其余搜索/筛选/批量操作都搬到 admin_table。
     with st.expander(tr("Library Upload"), expanded=False):
         uploaded_files = st.file_uploader(
             tr("Library Upload"),
@@ -9607,12 +10178,11 @@ def _render_media_library_page():
                 if saved or failures:
                     st.rerun()
 
-    filter_cols = st.columns([2.6, 1.0])
-    keyword = filter_cols[0].text_input(
-        tr("Library Search"),
-        key="ml_filter_keyword",
-        placeholder=tr("Library Search Placeholder"),
-    )
+    search_key = localized_widget_key("ml_admin_search")
+    kind_filter_key = localized_widget_key("ml_admin_kind")
+    keyword = st.session_state.get(search_key, "")
+    kind = st.session_state.get(kind_filter_key, "")
+
     # 翻译文案必须在创建控件之前算好：format_func 会在控件状态重建时被再次调用，
     # 那一刻不在脚本上下文里，读 st.session_state 会直接抛错。
     all_kinds_label = tr("Library Filter All Kinds")
@@ -9623,14 +10193,10 @@ def _render_media_library_page():
             for item in media_library.KINDS
         },
     }
-    kind = filter_cols[1].selectbox(
-        tr("Library Filter Kind"),
-        options=[""] + list(media_library.KIND_IDS),
-        format_func=lambda value, labels=kind_labels: labels.get(value, value),
-        key=localized_widget_key("ml_filter_kind"),
-    )
 
     materials = media_library.list_materials(keyword=keyword, kind=kind)
+    rows = _material_table_rows(materials, ui_language)
+
     if not materials:
         st.info(tr("Library No Materials"))
         return
@@ -9641,32 +10207,112 @@ def _render_media_library_page():
                 total=len(materials), shown=LIBRARY_PREVIEW_LIMIT
             )
         )
-    _render_record_table_hint()
-    selected = _render_record_table(
+
+    def _edit_material(row):
+        _material_detail_dialog(row["record"], ui_language)
+
+    def _delete_material(row):
+        media_library.delete_material(row["record"]["id"])
+        st.rerun(scope="app")
+
+    def _bulk_delete_materials(selected_rows):
+        for row in selected_rows:
+            try:
+                media_library.delete_material(row["record"]["id"])
+            except (OSError, ValueError):
+                st.session_state.setdefault(
+                    "ml_admin_bulk_skipped", []
+                ).append(row["record"]["display_name"])
+        st.rerun(scope="app")
+
+    _render_admin_table(
         "ml",
-        _material_table_rows(materials, ui_language),
-        {
-            "preview": st.column_config.ImageColumn(
-                tr("Library Col Preview"), width="small"
+        rows,
+        [
+            AdminColumn(
+                key="preview",
+                label=tr("Library Col Preview"),
+                ratio=1.0,
+                render=lambda r: r["preview"],
+                image=True,
             ),
-            "name": st.column_config.TextColumn(tr("Library Col Name"), width="medium"),
-            "kind": st.column_config.TextColumn(tr("Library Col Kind"), width="small"),
-            "spec": st.column_config.TextColumn(tr("Library Col Spec"), width="small"),
-            "size": st.column_config.TextColumn(tr("Library Col Size"), width="small"),
-            "status": st.column_config.TextColumn(
-                tr("Library Col Status"), width="small"
+            AdminColumn(
+                key="name",
+                label=tr("Library Col Name"),
+                ratio=1.6,
             ),
-            "created_at": st.column_config.TextColumn(
-                tr("Library Col Created"), width="small"
+            AdminColumn(
+                key="kind",
+                label=tr("Library Col Kind"),
+                ratio=0.8,
             ),
-            "remark": st.column_config.TextColumn(
-                tr("Library Col Remark"), width="medium"
+            AdminColumn(
+                key="spec",
+                label=tr("Library Col Spec"),
+                ratio=1.0,
             ),
-        },
-        caption=tr("Library Count").format(count=len(materials)),
+            AdminColumn(
+                key="size",
+                label=tr("Library Col Size"),
+                ratio=0.7,
+            ),
+            AdminColumn(
+                key="status",
+                label=tr("Library Col Status"),
+                ratio=0.7,
+            ),
+            AdminColumn(
+                key="created_at",
+                label=tr("Library Col Created"),
+                ratio=1.0,
+            ),
+            AdminColumn(
+                key="remark",
+                label=tr("Library Col Remark"),
+                ratio=2.0,
+            ),
+        ],
+        row_actions=[
+            AdminRowAction(
+                key="edit",
+                label=tr("Library Edit"),
+                icon=":material/edit:",
+                callback=_edit_material,
+            ),
+            AdminRowAction(
+                key="_admin_delete",
+                label=tr("Library Delete"),
+                icon=":material/delete:",
+                callback=_delete_material,
+            ),
+        ],
+        bulk_actions=[
+            AdminBulkAction(
+                key="bulk_del",
+                label=tr("Admin Bulk Delete"),
+                icon=":material/delete_sweep:",
+                callback=_bulk_delete_materials,
+            ),
+        ],
+        toolbar_search_label=tr("Library Search"),
+        toolbar_search_key=search_key,
+        toolbar_filters=[
+            AdminFilter(
+                label=tr("Library Filter Kind"),
+                options=[""] + list(media_library.KIND_IDS),
+                default="",
+                key=kind_filter_key,
+                format_func=lambda value, labels=kind_labels: labels.get(value, value),
+            ),
+        ],
+        empty_message=tr("Library No Materials"),
+        total_label=tr("Admin Total Of"),
+        page_label=tr("Admin Page Of"),
+        page_size=10,
     )
-    if selected is not None:
-        _material_detail_dialog(materials[selected], ui_language)
+
+    if st.session_state.pop("ml_admin_bulk_skipped", None):
+        st.warning(tr("Admin Bulk Delete Skipped"))
 
 
 @st.dialog(tr("Script Library Detail Title"), width="large", on_dismiss=_close_record_dialog)
@@ -9731,6 +10377,7 @@ def _script_table_rows(entries):
             else tr("Script Library No Video"),
             "generated_at": str(entry["generated_at"]).replace("T", " ")[:16],
             "task_id": entry["task_id"],
+            "record": entry,
         }
         for entry in entries
     ]
@@ -9752,48 +10399,106 @@ def _render_script_library_page():
     metric_cols[1].metric(tr("Script Stat Characters"), stats["characters"])
     metric_cols[2].metric(tr("Script Stat Videos"), stats["with_video"])
 
-    filter_cols = st.columns([2.6, 1.0])
-    keyword = filter_cols[0].text_input(
-        tr("Script Library Search"),
-        key="sl_filter_keyword",
-        placeholder=tr("Script Library Search Placeholder"),
-    )
-    only_with_video = filter_cols[1].checkbox(
-        tr("Script Library Only With Video"), key="sl_filter_has_video"
-    )
+    search_key = localized_widget_key("sl_admin_search")
+    only_with_video_key = localized_widget_key("sl_admin_only_video")
+    keyword = st.session_state.get(search_key, "")
+    only_with_video = bool(st.session_state.get(only_with_video_key, False))
 
     entries = script_library.list_scripts(
         keyword=keyword, only_with_video=only_with_video
     )
+    rows = _script_table_rows(entries)
+
     if not entries:
         st.info(tr("Script Library Empty"))
         return
 
-    _render_record_table_hint()
-    selected = _render_record_table(
+    def _edit_script(row):
+        _script_detail_dialog(row["record"])
+
+    def _delete_script(row):
+        script_library.delete_script(row["record"]["task_id"])
+        st.rerun(scope="app")
+
+    def _bulk_delete_scripts(selected_rows):
+        for row in selected_rows:
+            try:
+                script_library.delete_script(row["record"]["task_id"])
+            except (OSError, ValueError):
+                st.session_state.setdefault(
+                    "sl_admin_bulk_skipped", []
+                ).append(row["record"]["subject"])
+        st.rerun(scope="app")
+
+    _render_admin_table(
         "sl",
-        _script_table_rows(entries),
-        {
-            "subject": st.column_config.TextColumn(
-                tr("Script Col Subject"), width="large"
+        rows,
+        [
+            AdminColumn(
+                key="subject",
+                label=tr("Script Col Subject"),
+                ratio=2.5,
             ),
-            "char_count": st.column_config.NumberColumn(
-                tr("Script Col Chars"), width="small"
+            AdminColumn(
+                key="char_count",
+                label=tr("Script Col Chars"),
+                ratio=0.7,
             ),
-            "has_video": st.column_config.TextColumn(
-                tr("Script Col Has Video"), width="small"
+            AdminColumn(
+                key="has_video",
+                label=tr("Script Col Has Video"),
+                ratio=0.8,
             ),
-            "generated_at": st.column_config.TextColumn(
-                tr("Script Col Generated"), width="small"
+            AdminColumn(
+                key="generated_at",
+                label=tr("Script Col Generated"),
+                ratio=1.0,
             ),
-            "task_id": st.column_config.TextColumn(
-                tr("Script Col Task Id"), width="small"
+            AdminColumn(
+                key="task_id",
+                label=tr("Script Col Task Id"),
+                ratio=1.0,
             ),
-        },
-        caption=tr("Script Library Count").format(count=len(entries)),
+        ],
+        row_actions=[
+            AdminRowAction(
+                key="edit",
+                label=tr("Script Library Edit"),
+                icon=":material/edit:",
+                callback=_edit_script,
+            ),
+            AdminRowAction(
+                key="_admin_delete",
+                label=tr("Script Library Delete"),
+                icon=":material/delete:",
+                callback=_delete_script,
+            ),
+        ],
+        bulk_actions=[
+            AdminBulkAction(
+                key="bulk_del",
+                label=tr("Admin Bulk Delete"),
+                icon=":material/delete_sweep:",
+                callback=_bulk_delete_scripts,
+            ),
+        ],
+        toolbar_search_label=tr("Script Library Search"),
+        toolbar_search_key=search_key,
+        empty_message=tr("Script Library Empty"),
+        total_label=tr("Admin Total Of"),
+        page_label=tr("Admin Page Of"),
+        page_size=10,
     )
-    if selected is not None:
-        _script_detail_dialog(entries[selected])
+
+    # "仅含视频" 是布尔筛选，与 admin_table 的 selectbox 风格筛选不一致；
+    # 放在工具栏搜索框右侧，留一行独立 checkbox 而非塞进 toolbar。
+    st.checkbox(
+        tr("Script Library Only With Video"),
+        key=only_with_video_key,
+    )
+
+    if st.session_state.pop("sl_admin_bulk_skipped", None):
+        st.warning(tr("Admin Bulk Delete Skipped"))
 
 
 # 本次运行注册的页面对象，按 url_path 索引。st.switch_page 不支持按路径跳转
@@ -9942,4 +10647,7 @@ def _render_application():
         _save_runtime_config()
 
 
-_render_navigation()
+if __name__ != "__main__":
+    pass  # 模块被 import 时不启动导航，避免副作用。
+else:
+    _render_navigation()
