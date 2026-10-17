@@ -11,6 +11,26 @@ div[data-testid="stMainBlockContainer"] {
     padding-top: 0.5rem !important;
 }
 
+/* st.navigation 的页面导航栏渲染在侧边栏里，而侧边栏一旦折叠，唯一的唤出入口
+   是 stExpandSidebarButton —— 它嵌在 stToolbar 里，正是上面被隐藏的元素。
+   结果：窄视口（initial_sidebar_state="auto" 会自动折叠）或用户手动折叠后，
+   导航栏永久无法唤出。这里只对「折叠态」恢复 header 与 toolbar，保留这个开关；
+   展开态仍沿用上面的紧凑样式，顶部空白不会回归。
+   额外为顶部预留高度，避免开关与品牌标题重叠。 */
+body:has(section[data-testid="stSidebar"][aria-expanded="false"])
+    header[data-testid="stHeader"],
+body:has(section[data-testid="stSidebar"][aria-expanded="false"])
+    header[data-testid="stHeader"]
+    div[data-testid="stToolbar"] {
+    display: flex !important;
+    background: transparent !important;
+}
+
+body:has(section[data-testid="stSidebar"][aria-expanded="false"])
+    div[data-testid="stMainBlockContainer"] {
+    padding-top: 3.25rem !important;
+}
+
 h1 {
     padding-top: 0 !important;
     margin-top: 0 !important;
@@ -483,4 +503,172 @@ div[class*="st-key-task_row_"] button[kind="secondary"] p {
         width: auto !important;
         min-width: 1.75rem !important;
     }
+}
+
+/* -----------------------------------------------------------------------------
+   管理页抽屉：把 st.dialog 改造成右侧滑出的面板
+   -----------------------------------------------------------------------------
+   发布管理 / 账号管理 / 素材库的新增与编辑统一用抽屉。Streamlit 没有原生抽屉，
+   这里沿用 @st.dialog 的生命周期（fragment 状态、ESC 与点击遮罩关闭都由它管），
+   只用 CSS 把「居中弹窗」换成「右侧面板」。
+
+   作用范围必须限定在带 .mpt-admin-drawer 标记的对话框内：设置、任务恢复等
+   对话框仍保持居中弹窗形态。 */
+
+div[data-testid="stDialog"]:has(.mpt-admin-drawer) {
+    justify-content: flex-end !important;
+    /* 不用 stretch：面板高度交给内容决定，超出视口时由遮罩层滚动，
+       这样长表单不会被 overflow:hidden 裁掉。 */
+    align-items: flex-start !important;
+    padding: 0 !important;
+}
+
+div[data-testid="stDialog"]:has(.mpt-admin-drawer)
+    > div:has(> section[role="dialog"]) {
+    width: min(560px, 100vw) !important;
+    max-width: min(560px, 100vw) !important;
+    height: auto !important;
+    min-height: 100% !important;
+    max-height: none !important;
+    margin: 0 !important;
+    border-radius: 0 !important;
+    animation: mpt-drawer-slide-in 0.2s ease-out;
+}
+
+@keyframes mpt-drawer-slide-in {
+    from {
+        transform: translateX(28px);
+        opacity: 0.35;
+    }
+    to {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
+/* 抽屉里的操作按钮按容器宽度均分，避免「取消」挤成一个小方块。 */
+div[data-testid="stDialog"]:has(.mpt-admin-drawer)
+    section[role="dialog"]
+    div[data-testid="stHorizontalBlock"]
+    > div[data-testid="stColumn"]
+    button {
+    width: 100% !important;
+}
+
+/* -----------------------------------------------------------------------------
+   管理页表格：表头 + 数据行拼成一张标准表
+   -----------------------------------------------------------------------------
+   admin_table 由「表头容器 + 表体容器」两段组成，靠 st-key-admin_head_* /
+   st-key-admin_body_* / st-key-admin_row_* 三个钩子拼出外框、表头底色、
+   行分隔线与悬停高亮。
+   颜色一律用 currentColor 混色，浅色与深色主题都能自适应。 */
+
+div[class*="st-key-admin_head_"] {
+    padding: 0.4rem 0.75rem 0.3rem !important;
+    border: 1px solid color-mix(in srgb, currentColor 14%, transparent) !important;
+    border-bottom: 0 !important;
+    border-radius: 8px 8px 0 0 !important;
+    background: color-mix(in srgb, currentColor 7%, transparent) !important;
+}
+
+div[class*="st-key-admin_head_"] p {
+    margin-bottom: 0 !important;
+    font-size: 0.8125rem !important;
+    line-height: 1.5 !important;
+    opacity: 0.85;
+}
+
+div[class*="st-key-admin_body_"] {
+    border: 1px solid color-mix(in srgb, currentColor 14%, transparent) !important;
+    border-top: 0 !important;
+    border-radius: 0 0 8px 8px !important;
+    overflow: hidden !important;
+    /* 表体自身就是那个纵向 flex 容器，默认 gap 16px 会把行分隔线拆成一段段
+       「卡片」。压成 0 让行与行紧贴，才是一张表。
+       注意 st.container(key=...) 把 key 类挂在 stVerticalBlock **自身**上，
+       所以这里必须直接写容器选择器，写成后代选择器是匹配不到的。 */
+    gap: 0 !important;
+}
+
+/* 行外层还包着一层 stLayoutWrapper，它的行间距同样要压掉。 */
+div[class*="st-key-admin_body_"]
+    > div[data-testid="stLayoutWrapper"] {
+    gap: 0 !important;
+}
+
+div[class*="st-key-admin_row_"] {
+    padding: 0.4rem 0.75rem !important;
+    border-top: 1px solid color-mix(in srgb, currentColor 9%, transparent) !important;
+    transition: background-color 0.12s ease;
+}
+
+div[class*="st-key-admin_row_"]:hover {
+    background: color-mix(in srgb, currentColor 5%, transparent) !important;
+}
+
+/* 行内文本压掉 Streamlit 默认的段落下边距，否则每行都会被撑高；
+   字号统一收到 13px：管理表列多，14px 下「2026-10-16 23:37」这类时间戳
+   会被挤成两行，13px 刚好一行放得下，也和 antd 紧凑表一致。 */
+div[class*="st-key-admin_body_"] p {
+    margin-bottom: 0 !important;
+    font-size: 0.8125rem !important;
+    line-height: 1.5 !important;
+}
+
+/* 素材缩略图统一裁成 64×64 方块。素材多为竖图（实测 466×831），
+   按原比例渲染会把单行行高从 56px 撑到 128px，同一张表里行高参差不齐。 */
+div[class*="st-key-admin_body_"] [data-testid="stImage"] img {
+    width: 64px !important;
+    height: 64px !important;
+    object-fit: cover;
+    border-radius: 4px;
+}
+
+/* -----------------------------------------------------------------------------
+   管理页分页栏：antd Pagination 形态
+   -----------------------------------------------------------------------------
+   左侧是总条数，右侧是「每页条数 + 页码 + 上下页」。页码按钮收紧成方形小块，
+   当前页用主色实心表示，跳页省略号单独占位。 */
+
+div[class*="st-key-admin_pager_"] {
+    gap: 0.35rem !important;
+}
+
+div[class*="st-key-admin_pager_"] button {
+    min-width: 2rem !important;
+    min-height: 2rem !important;
+    height: 2rem !important;
+    padding: 0 0.35rem !important;
+    font-size: 0.8125rem !important;
+    font-variant-numeric: tabular-nums;
+}
+
+/* 分页栏里的「每页条数」选择器收成 antd 那种窄选择器：Streamlit 的 selectbox
+   默认 width:100%，放进横向容器里会撑掉大半个分页栏。同时把其余子项固定成
+   内容宽度，页码按钮才不会被拉伸。
+   注意 Streamlit 1.59 的 selectbox 已从 BaseWeb 换成 react-aria，
+   ``div[data-baseweb="select"]`` 这个老钩子现在匹配不到任何元素。 */
+div[class*="st-key-admin_pager_"] > div[data-testid="stElementContainer"] {
+    flex: 0 0 auto !important;
+    width: auto !important;
+}
+
+div[class*="st-key-admin_pager_"] [class*="_admin_page_size_"] {
+    min-width: 8rem !important;
+    max-width: 9rem !important;
+}
+
+div[class*="st-key-admin_pager_"] [data-testid="stSelectbox"] [role="group"] {
+    min-height: 2rem !important;
+    font-size: 0.8125rem !important;
+}
+
+.mpt-pager-gap {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.25rem;
+    height: 2rem;
+    opacity: 0.55;
+    letter-spacing: 0.08em;
 }

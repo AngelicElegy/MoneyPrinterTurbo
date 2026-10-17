@@ -216,6 +216,16 @@ def _get_required_video_duration(audio_duration: float) -> float:
     return max(0.0, float(audio_duration) + _VIDEO_DURATION_SAFETY_MARGIN)
 
 
+def minimum_material_dimension() -> int:
+    """素材允许的最小边长（标称 480 减去取整容差）。
+
+    合成阶段和上传校验共用这一个值：两边各写一份的话，一旦有人只改了其中
+    一边，就会出现「素材库能传进来、但每次合成都必然失败」的情况，用户要等
+    整个预处理跑完才知道，反馈成本极高。
+    """
+    return _MIN_MATERIAL_DIMENSION - _MIN_DIMENSION_TOLERANCE
+
+
 def is_material_resolution_acceptable(width: int, height: int) -> bool:
     """
     判断素材分辨率是否足够用于合成。
@@ -223,7 +233,7 @@ def is_material_resolution_acceptable(width: int, height: int) -> bool:
     标称最小值是 480x480，但允许比它低 `_MIN_DIMENSION_TOLERANCE` 个像素，
     以兼容编码器/消息应用向下取整导致的尺寸（例如 WhatsApp 的 478x850）。
     """
-    min_dimension = _MIN_MATERIAL_DIMENSION - _MIN_DIMENSION_TOLERANCE
+    min_dimension = minimum_material_dimension()
     return width >= min_dimension and height >= min_dimension
 
 

@@ -154,6 +154,15 @@ ENGLISH_FALLBACK_KEYS = frozenset(
         "VoxCPM Prompt Pair Required",
         "VoxCPM Prompt Invalid",
         "None (Animation)",
+        # 视频管理页（原发布管理）新增 / 重命名的 WebUI 标签，次要语言统一回退英文。
+        "Nav Video Management",
+        "Video Management Title",
+        "Video Management Help",
+        "Board Play",
+        "Board Download",
+        "Board Script Excerpt",
+        "Board Duration",
+        "Board Video Read Failed",
     }
 )
 FORMAT_PLACEHOLDER_PATTERN = re.compile(r"(?<!\{)\{([a-zA-Z_][a-zA-Z0-9_]*)\}(?!\})")

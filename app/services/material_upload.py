@@ -1,9 +1,10 @@
+import math
 import os
 import subprocess
 import tempfile
 import warnings
 from pathlib import Path
-from typing import BinaryIO, Literal
+from typing import BinaryIO, Literal, Optional
 from uuid import uuid4
 
 from loguru import logger
@@ -17,6 +18,9 @@ from app.utils import utils
 MAX_VIDEO_MATERIAL_UPLOAD_BYTES = 200 * 1024 * 1024
 MAX_IMAGE_MATERIAL_UPLOAD_BYTES = 20 * 1024 * 1024
 MATERIAL_VALIDATION_TIMEOUT_SECONDS = 120
+# 手动裁剪允许的最小边长。再小就只剩几个像素，裁出来既看不清也放不大，
+# 与其入库后每次都失败，不如在这里直接拒绝。
+CROP_MIN_PIXELS = 16
 
 # Keep these aligned with the local material formats the CLI accepts (cli.py
 # derives its list from const.FILE_TYPE_VIDEOS / const.FILE_TYPE_IMAGES) and the
@@ -72,6 +76,24 @@ _IMAGE_FORMATS_BY_EXTENSION = {
 
 class MaterialUploadError(ValueError):
     """The uploaded material does not satisfy the file or media requirements."""
+
+
+class MaterialResolutionError(MaterialUploadError):
+    """The uploaded material is smaller than the minimum usable for synthesis.
+
+    Carries the measured size and the threshold so callers that render text for
+    humans (the WebUI) can localize the message instead of showing the English
+    string produced here, which is what the HTTP API still returns.
+    """
+
+    def __init__(self, width: int, height: int, minimum: int) -> None:
+        self.width = width
+        self.height = height
+        self.minimum = minimum
+        super().__init__(
+            f"material resolution {width}x{height} is below the "
+            f"{minimum}x{minimum} minimum required for video synthesis"
+        )
 
 
 class MaterialServiceError(RuntimeError):
@@ -291,6 +313,180 @@ def _stage_material_upload(
             pass
 
 
+def _probe_material_dimensions(
+    file_path: str, material_kind: str
+) -> tuple[Optional[int], Optional[int]]:
+    """读取素材宽高，读不出来就返回 ``(None, None)``。
+
+    ``media_library`` 在模块级 import 了本模块，这里只能延迟 import，否则循环导入。
+    复用它而不是另写一份 ffprobe：那边的探测已经加了 ``-protocol_whitelist file,pipe``，
+    并且对各种损坏文件做了降级，重新实现一遍容易漏掉这些防护。
+    """
+    from app.services import media_library
+
+    metadata = media_library.probe_metadata(file_path, material_kind)
+    return metadata.get("width"), metadata.get("height")
+
+
+def minimum_material_dimension() -> int:
+    """合成门槛的唯一定义来源，避免本模块和 WebUI 各抄一份。"""
+    from app.services import video as video_service
+
+    return video_service.minimum_material_dimension()
+
+
+def _validate_material_resolution(file_path: str, material_kind: str) -> None:
+    """按合成阶段的门槛校验分辨率，不合格就在上传时直接拒绝。
+
+    合成阶段（``video.preprocess_video``）会丢弃低于门槛的素材，全部被丢弃时
+    任务才在 materials 阶段失败。用户往往已经把素材加进库、选中、跑了一轮，
+    才看到 "no valid local video materials were found"，而真正的原因只是某条边
+    少了几像素。把同一个判断提前到入口，失败就能发生在还能立刻换素材的时刻。
+
+    探测不到尺寸时不拦截：那种情况连合成阶段也无从判断，拦下来只会把
+    「文件损坏」误报成「分辨率不足」。
+    """
+    from app.services import video as video_service
+
+    width, height = _probe_material_dimensions(file_path, material_kind)
+    if width is None or height is None:
+        return
+    if video_service.is_material_resolution_acceptable(int(width), int(height)):
+        return
+    raise MaterialResolutionError(
+        int(width), int(height), minimum_material_dimension()
+    )
+
+
+def inspect_material_resolution(filename: str, source: BinaryIO) -> dict:
+    """只量尺寸、不落盘的轻量校验，供 WebUI 在上传控件旁即时给出裁剪入口。
+
+    与 :func:`_validate_material_resolution` 共用同一份门槛判断：探测不到尺寸时
+    返回 ``acceptable=True``（交给后续流程），避免把「文件损坏」误报成「分辨率不足」。
+    这里会像真正上传一样把数据流落到一个临时文件再探测，因此文件损坏 / 解码失败
+    时同样返回 ``acceptable=True``，差别只在 WebUI 渲染时不再把它当成可裁剪项。
+    """
+    from app.services import video as video_service
+
+    safe_name, material_kind, temp_path, _total_bytes = _stage_material_upload(
+        filename, source
+    )
+    try:
+        width, height = _probe_material_dimensions(temp_path, material_kind)
+        minimum = minimum_material_dimension()
+        if width is None or height is None:
+            acceptable = True
+        else:
+            acceptable = video_service.is_material_resolution_acceptable(
+                int(width), int(height)
+            )
+        return {
+            "kind": material_kind,
+            "width": width,
+            "height": height,
+            "minimum": minimum,
+            "acceptable": acceptable,
+        }
+    finally:
+        _remove_staged_file(temp_path)
+
+
+def crop_and_fit(
+    image: "Image.Image", box: tuple[int, int, int, int], minimum: int
+) -> tuple["Image.Image", float]:
+    """把图片裁到 ``box``，必要时等比放大到刚好够 ``minimum``。
+
+    裁剪只会让图片变小，所以裁完仍然低于门槛时必须放大，否则这次裁剪等于白做——
+    下次合成还是会整批丢弃。放大倍数取「刚好让短边达到门槛」的那个最小值：
+    合成阶段本来就会把素材铺满输出画幅，这里多放的每一像素都只是白白变糊。
+
+    返回（裁剪后的图, 放大倍数）；没有放大时倍数为 1.0。
+    """
+    width, height = image.size
+    left, top, right, bottom = (int(value) for value in box)
+    left = min(max(left, 0), width - 1)
+    top = min(max(top, 0), height - 1)
+    right = min(max(right, left + 1), width)
+    bottom = min(max(bottom, top + 1), height)
+    if right - left < CROP_MIN_PIXELS or bottom - top < CROP_MIN_PIXELS:
+        raise MaterialUploadError(
+            f"crop area must be at least {CROP_MIN_PIXELS}x{CROP_MIN_PIXELS} pixels"
+        )
+
+    cropped = image.crop((left, top, right, bottom))
+    scale = max(minimum / cropped.width, minimum / cropped.height, 1.0)
+    if scale <= 1.0:
+        return cropped, 1.0
+
+    # 用 ceil 而不是 round：缩放后四舍五入有可能把短边又压回门槛以下。
+    fitted = cropped.resize(
+        (
+            max(minimum, math.ceil(cropped.width * scale)),
+            max(minimum, math.ceil(cropped.height * scale)),
+        ),
+        Image.Resampling.LANCZOS,
+    )
+    return fitted, scale
+
+
+def _crop_target_extension(safe_name: str) -> str:
+    """裁剪结果沿用原图的压缩方式：照片存 JPEG，其余存 PNG。
+
+    截图/带透明通道的图存 JPEG 会丢掉 alpha 并产生压缩噪点，而大照片存 PNG
+    又会膨胀到十几 MB，两种都不合适。
+    """
+    return ".jpg" if Path(safe_name).suffix.lower() in {".jpg", ".jpeg"} else ".png"
+
+
+def _save_cropped_image(image: "Image.Image", target_path: str, extension: str) -> None:
+    if extension == ".jpg":
+        if image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+        image.save(target_path, "JPEG", quality=92, optimize=True)
+    else:
+        if image.mode == "P":
+            image = image.convert("RGBA")
+        image.save(target_path, "PNG", optimize=True)
+
+
+def save_material_crop(
+    filename: str, source: BinaryIO, box: tuple[int, int, int, int]
+) -> str:
+    """把用户手动选定的裁剪区域存成素材，返回存储文件名。
+
+    这是上传被分辨率校验拒掉之后的补救路径：用户没法把 466px 的截图变宽，
+    但可以自己选一段真正想用的画面，由这里裁出来并按需放大到门槛。
+    只有图片支持裁剪；视频要裁得走 FFmpeg 重编码，不在这一条路径上。
+    """
+    safe_name, material_kind, temp_path, _total_bytes = _stage_material_upload(
+        filename, source
+    )
+    if material_kind != "image":
+        _remove_staged_file(temp_path)
+        raise MaterialUploadError("only images can be cropped")
+
+    extension = _crop_target_extension(safe_name)
+    stored_name = f"{uuid4().hex}{extension}"
+    target_path = os.path.join(os.path.dirname(temp_path), stored_name)
+    try:
+        with Image.open(temp_path) as image:
+            fitted, _scale = crop_and_fit(image, box, minimum_material_dimension())
+            _save_cropped_image(fitted, target_path, extension)
+        # 自己生成的文件也要过一遍解码校验：写盘失败、磁盘写满这类问题
+        # 不应该等到合成阶段才以「素材损坏」的形式暴露出来。
+        _validate_image(target_path, extension)
+    except Exception:
+        _remove_staged_file(target_path)
+        raise
+    finally:
+        _remove_staged_file(temp_path)
+    logger.info(
+        f"local material cropped: original_name={safe_name}, "
+        f"stored_name={stored_name}, box={box}"
+    )
+    return stored_name
+
+
 def save_material_upload(filename: str, source: BinaryIO) -> str:
     """Validate and atomically persist an uploaded local video or image."""
     safe_name, material_kind, temp_path, total_bytes = _stage_material_upload(
@@ -305,6 +501,7 @@ def save_material_upload(filename: str, source: BinaryIO) -> str:
             _validate_video(temp_path)
         else:
             _validate_image(temp_path, extension)
+        _validate_material_resolution(temp_path, material_kind)
 
         try:
             os.replace(temp_path, target_path)
